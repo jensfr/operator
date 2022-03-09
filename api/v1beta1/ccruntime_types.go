@@ -144,6 +144,34 @@ type CcInstallConfig struct {
 	// If both bundleImage and guestInitrdImage are specified, then guestInitrdImage content will override the equivalent one in payloadImage
 	// +optional
 	GuestInitrdImage string `json:"guestInitrdImage,omitempty"`
+
+	// This specifies volume mounts required for the installer pods
+	// +optional
+	InstallerVolumeMounts []corev1.VolumeMount `json:"installerVolumeMounts,omitempty"`
+
+	// This specifies volumes required for the installer pods
+	// +optional
+	InstallerVolumes []corev1.Volume `json:"installerVolumes,omitempty"`
+
+	// This specifies the command for installation of the runtime on the nodes
+	// +optional
+	InstallCmd []string `json:"installCmd,omitempty"`
+
+	// This specifies the command for uninstallation of the runtime on the nodes
+	// +optional
+	UninstallCmd []string `json:"uninstallCmd,omitempty"`
+
+	// This specifies the command for cleanup on the nodes
+	// +optional
+	CleanupCmd []string `json:"cleanupCmd,omitempty"`
+
+	// This specifies a node selector to define which nodes to install on
+	// +optional
+	CleanupNodeSelector *metav1.LabelSelector `json:"ccNodeSelector,omitempty"`
+
+	// This specifies the environment variables required by the daemon set
+	// +optional
+	EnvironmentVariables []corev1.EnvVar `json:"environmentVariables,omitempty"`
 }
 
 // CcInstallationStatus reflects the status of the ongoing confidential containers runtime installation

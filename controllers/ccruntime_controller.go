@@ -350,10 +350,9 @@ func (r *CcRuntimeReconciler) setRuntimeClass() (ctrl.Result, error) {
 func (r *CcRuntimeReconciler) processDaemonset(operation DaemonOperation) *appsv1.DaemonSet {
 	runPrivileged := true
 	var runAsUser int64 = 0
-	hostPt := corev1.HostPathType("DirectoryOrCreate")
 
 	dsName := "cc-operator-daemon-" + string(operation)
-	labels := map[string]string{
+	dsLabelSelectors := map[string]string{
 		"name": dsName,
 	}
 
@@ -368,25 +367,25 @@ func (r *CcRuntimeReconciler) processDaemonset(operation DaemonOperation) *appsv
 		}
 	}
 
-	containerCommand := []string{}
+	var containerCommand []string
 	preStopHook := &corev1.Lifecycle{}
 
+	r.Log.Info("cleanupCmd in kataconfig", "cleanupCmd", r.ccRuntime.Spec.Config.CleanupCmd)
 	if operation == InstallOperation {
+		r.Log.Info("in installop")
 		preStopHook = &corev1.Lifecycle{
 			PreStop: &corev1.Handler{
 				Exec: &corev1.ExecAction{
-					Command: []string{"bash", "-c", "/opt/kata-artifacts/scripts/kata-deploy.sh cleanup"},
+					Command: r.ccRuntime.Spec.Config.CleanupCmd,
 				},
 			},
 		}
-		containerCommand = []string{"bash", "-c", "/opt/kata-artifacts/scripts/kata-deploy.sh install"}
+		containerCommand = r.ccRuntime.Spec.Config.InstallCmd
 	}
 
 	if operation == UninstallOperation {
-		containerCommand = []string{"bash", "-c", "/opt/kata-artifacts/scripts/kata-deploy.sh reset"}
-		nodeSelector = map[string]string{
-			"katacontainers.io/kata-runtime": "cleanup",
-		}
+		containerCommand = r.ccRuntime.Spec.Config.UninstallCmd
+		nodeSelector = r.ccRuntime.Spec.Config.CleanupNodeSelector.MatchLabels
 	}
 
 	return &appsv1.DaemonSet{
@@ -400,7 +399,7 @@ func (r *CcRuntimeReconciler) processDaemonset(operation DaemonOperation) *appsv
 		},
 		Spec: appsv1.DaemonSetSpec{
 			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
+				MatchLabels: dsLabelSelectors,
 			},
 			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
 				Type: "RollingUpdate",
@@ -413,7 +412,7 @@ func (r *CcRuntimeReconciler) processDaemonset(operation DaemonOperation) *appsv
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
+					Labels: dsLabelSelectors,
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "cc-operator-controller-manager",
@@ -429,100 +428,12 @@ func (r *CcRuntimeReconciler) processDaemonset(operation DaemonOperation) *appsv
 								Privileged: &runPrivileged,
 								RunAsUser:  &runAsUser,
 							},
-							Command: containerCommand,
-							Env: []corev1.EnvVar{
-								{
-									Name: "NODE_NAME",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{
-											FieldPath: "spec.nodeName",
-										},
-									},
-								},
-								{
-									Name:  "CONFIGURE_CC",
-									Value: "yes",
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "crio-conf",
-									MountPath: "/etc/crio/",
-								},
-								{
-									Name:      "containerd-conf",
-									MountPath: "/etc/containerd/",
-								},
-								{
-									Name:      "kata-artifacts",
-									MountPath: "/opt/kata/",
-								},
-								{
-									Name:      "dbus",
-									MountPath: "/var/run/dbus",
-								},
-								{
-									Name:      "systemd",
-									MountPath: "/run/systemd",
-								},
-								{
-									Name:      "local-bin",
-									MountPath: "/usr/local/bin/",
-								},
-							},
+							Command:      containerCommand,
+							Env:          r.ccRuntime.Spec.Config.EnvironmentVariables,
+							VolumeMounts: r.ccRuntime.Spec.Config.InstallerVolumeMounts,
 						},
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "crio-conf",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/etc/crio/",
-								},
-							},
-						},
-						{
-							Name: "containerd-conf",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/etc/containerd/",
-								},
-							},
-						},
-						{
-							Name: "kata-artifacts",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/opt/kata/",
-									Type: &hostPt,
-								},
-							},
-						},
-						{
-							Name: "dbus",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/var/run/dbus",
-								},
-							},
-						},
-						{
-							Name: "systemd",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/run/systemd",
-								},
-							},
-						},
-						{
-							Name: "local-bin",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/usr/local/bin/",
-								},
-							},
-						},
-					},
+					Volumes: r.ccRuntime.Spec.Config.InstallerVolumes,
 				},
 			},
 		},
