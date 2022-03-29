@@ -172,6 +172,57 @@ type CcInstallConfig struct {
 	// This specifies the environment variables required by the daemon set
 	// +optional
 	EnvironmentVariables []corev1.EnvVar `json:"environmentVariables,omitempty"`
+
+	// This specifies the configuration for the pre-install daemonset
+	// +optional
+	PreInstall PreInstallConfig `json:"preInstall,omitempty"`
+
+	// This specifies the configuration for the post-uninstall daemonset
+	// +optional
+	PostUninstall PostUninstallConfig `json:"postUninstall,omitempty"`
+}
+
+type PostUninstallConfig struct {
+	// This specifies the command executes before InstallCmd
+	// +optional
+	Cmd []string `json:"cmd,omitempty"`
+
+	// This specifies the pull spec for the postuninstall daemonset image
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// This specifies the env variables for the post-uninstall daemon set
+	// +optional
+	EnvironmentVariables []corev1.EnvVar `json:"environmentVariables,omitempty"`
+
+	// This specifies the volumes for the post-uninstall daemon set
+	// +optional
+	Volumes []corev1.Volume `json:"volumes,omitempty"`
+
+	// This specifies the volumeMounts for the post-uninstall daemon set
+	// +optional
+	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
+}
+
+type PreInstallConfig struct {
+	// This specifies the command executes before InstallCmd
+	// +optional
+	Cmd []string `json:"cmd,omitempty"`
+
+	// This specifies the image for the pre-install scripts
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// This specifies the env variables for the pre-install daemon set
+	// +optional
+	EnvironmentVariables []corev1.EnvVar `json:"environmentVariables,omitempty"`
+
+	// This specifies the volumes for the pre-install daemon set
+	// +optional
+	Volumes []corev1.Volume `json:"volumes,omitempty"`
+	// This specifies the volumeMounts for the pre-install daemon set
+	// +optional
+	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 }
 
 // CcInstallationStatus reflects the status of the ongoing confidential containers runtime installation
