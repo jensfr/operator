@@ -112,16 +112,7 @@ func (r *CcRuntimeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		} else {
 			return ctrl.Result{}, nil
 		}
-		if r.ccRuntime.Spec.Config.PostUninstall.Image != "" {
-			r.Log.Info("calling handlePostUninstall")
-			err, res := handlePostUninstall(r)
-			{
-				if err != nil && res.Requeue {
-					r.Log.Info("error or requeue from handlePostUninstall")
-					return res, err
-				}
-			}
-		}
+
 	}
 
 	return r.processCcRuntimeInstallRequest()
@@ -215,17 +206,22 @@ func (r *CcRuntimeReconciler) processCcRuntimeDeleteRequest() (ctrl.Result, erro
 		// If no nodes exist then remove finalizer and reconcile
 		err, nodes := r.getNodesWithLabels(r.ccRuntime.Spec.Config.UninstallDoneLabel)
 		if err != nil {
-			r.Log.Info("type of error", "type", reflect.TypeOf(err))
-			if errors.IsNotFound(err) || errors.IsGone(err) {
-				// Check for nodes with label set by install DS prestop hook.
-				// If no nodes exist then remove finalizer and reconcile
-				err, nodes := r.getNodesWithLabels(map[string]string{"katacontainers.io/kata-runtime": "cleanup"})
-				if err != nil {
-					r.Log.Error(err, "Error in getting list of nodes with label katacontainers.io/kata-runtime=cleanup")
-					return ctrl.Result{}, err
-				}
-				if len(nodes.Items) == 0 {
-					r.Log.Info("No Nodes with required labels found. Remove Finalizer")
+			r.Log.Error(err, "Error in getting list of nodes with label katacontainers.io/kata-runtime=cleanup")
+			return ctrl.Result{}, err
+		}
+		finishedNodes := len(nodes.Items)
+		if !allNodesDone(finishedNodes, r) {
+			result, err = r.setCleanupNodeLabels()
+			if err != nil {
+				r.Log.Error(err, "updating the cleanup labels on nodes failed")
+				return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, err
+			}
+		} else {
+			if r.ccRuntime.Spec.Config.PostUninstall.Image == "" {
+				controllerutil.RemoveFinalizer(r.ccRuntime, RuntimeConfigFinalizer)
+			} else if r.ccRuntime.Spec.Config.PostUninstall.Image != "" {
+				result, err = handlePostUninstall(r)
+				if !result.Requeue {
 					controllerutil.RemoveFinalizer(r.ccRuntime, RuntimeConfigFinalizer)
 					result, err = r.updateCcRuntime()
 					if err != nil {
@@ -270,21 +266,44 @@ func (r *CcRuntimeReconciler) updateUninstallationStatus(finishedNodes int) (ctr
 		return ctrl.Result{}, err
 	}
 
-	r.Log.Info("postuninstall image2", "r.ccRuntime.Spec.Config.Image",
-		r.ccRuntime.Spec.Config.PostUninstall.Image)
+	// Update CR
+	r.ccRuntime.Status.UnInstallationStatus.Completed.CompletedNodesCount = finishedNodes
+	r.ccRuntime.Status.UnInstallationStatus.InProgress.InProgressNodesCount = r.ccRuntime.Status.TotalNodesCount - finishedNodes
+	for i := range cleanupNodes.Items {
+		doneNodes = append(doneNodes, cleanupNodes.Items[i].Name)
+	}
+	r.ccRuntime.Status.UnInstallationStatus.InProgress.BinariesUnInstalledNodesList = doneNodes
+	err = r.Client.Update(context.TODO(), r.ccRuntime)
+	if err != nil {
+		r.Log.Error(err, "failed to update ccRuntime with finalizer")
+		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func handlePostUninstall(r *CcRuntimeReconciler) (ctrl.Result, error) {
+	err, nodes := r.getNodesWithLabels(map[string]string{"cc-postuninstall/done": "true"})
+	if err != nil {
+		r.Log.Info("couldn't get nodes labeled with postuninstall done label")
+		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
+	}
 
 	if r.ccRuntime.Spec.Config.PostUninstall.Image != "" &&
 		len(nodes.Items) < r.ccRuntime.Status.TotalNodesCount &&
 		r.ccRuntime.Status.TotalNodesCount > 0 {
 		postUninstallDs := r.makeHookDaemonset(PostUninstallOperation)
-		r.Log.Info("ds = ", "daemonset", postUninstallDs)
 		// get daemonset
 		res, err := r.handlePrePostDs(postUninstallDs, map[string]string{"cc-postuninstall/done": "true"})
 		if res.Requeue == true {
-			return err, res
+			if err != nil {
+				r.Log.Info("error from handlePrePostDs")
+			}
 		}
+		return res, err
+	} else if len(nodes.Items) == r.ccRuntime.Status.TotalNodesCount {
+		return ctrl.Result{}, nil
 	}
-	return err, ctrl.Result{}
+	return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
 }
 
 func (r *CcRuntimeReconciler) processCcRuntimeInstallRequest() (ctrl.Result, error) {
@@ -329,15 +348,13 @@ func (r *CcRuntimeReconciler) processCcRuntimeInstallRequest() (ctrl.Result, err
 		r.Log.Info("couldn't GET labelled nodes")
 		return ctrl.Result{}, err
 	}
-
 	if r.ccRuntime.Spec.Config.PreInstall.Image != "" &&
-		len(nodes.Items) < r.ccRuntime.Status.TotalNodesCount &&
-		r.ccRuntime.Status.TotalNodesCount > 0 {
-		r.Log.Info("inside != nil check")
+		len(nodes.Items) < r.ccRuntime.Status.TotalNodesCount {
 		preInstallDs := r.makeHookDaemonset(PreInstallOperation)
 		r.Log.Info("ds = ", "daemonset", preInstallDs)
 		res, err := r.handlePrePostDs(preInstallDs, map[string]string{"cc-preinstall/done": "true"})
 		if res.Requeue == true {
+			r.Log.Info("requeue request from handlePrePostDs")
 			return res, err
 		}
 	}
@@ -369,36 +386,37 @@ func (r *CcRuntimeReconciler) processCcRuntimeInstallRequest() (ctrl.Result, err
 	//return ctrl.Result{}, err
 }
 
+/*
+ This creates DaemonSets for pre-install/post-uninstall unless it already exists.
+ We leave the DaemonSets running until the ccRuntime finalizer is called.
+ This way the running DaemonSet automatically applies changes when a new
+ node is added.
+*/
 func (r *CcRuntimeReconciler) handlePrePostDs(preInstallDs *appsv1.DaemonSet, doneLabel map[string]string) (
 	ctrl.Result, error,
 ) {
 	foundPreinstallDs := &appsv1.DaemonSet{}
 	err := r.Client.Get(context.TODO(), types.NamespacedName{Name: preInstallDs.Name, Namespace: preInstallDs.Namespace}, foundPreinstallDs)
+	r.Log.Info("create preinstall/postuninstall DS", "DS", preInstallDs)
 	if err != nil && errors.IsNotFound(err) {
 		err = r.Client.Create(context.TODO(), preInstallDs)
 		if err != nil {
-			r.Log.Info("failed to create preinstall/postuninstall DS")
+			r.Log.Info("failed to create preinstall/postuninstall DS", "DS", preInstallDs)
 			return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
 		}
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, nil
 	} else if err != nil {
-		r.Log.Info("couldn't GET preinstall/postuninstall DS")
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
 	}
 	// if ds exists, get all labels
 	err, nodes := r.getNodesWithLabels(doneLabel)
 	if err != nil {
-		r.Log.Info("couldn't GET labelled nodes")
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
 	}
 	if len(nodes.Items) < r.ccRuntime.Status.TotalNodesCount {
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
 	}
-	err = r.Client.Delete(context.TODO(), foundPreinstallDs)
-	if err != nil {
-		r.Log.Info("couldn't DELETE labelled nodes")
-		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
-	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -729,7 +747,7 @@ func (r *CcRuntimeReconciler) makeHookDaemonset(operation DaemonOperation) *apps
 		dsName = "cc-operator-pre-install-daemon"
 		image = r.ccRuntime.Spec.Config.PreInstall.Image
 		volumeMounts = r.ccRuntime.Spec.Config.PreInstall.VolumeMounts
-		volumes = r.ccRuntime.Spec.Config.PostUninstall.Volumes
+		volumes = r.ccRuntime.Spec.Config.PreInstall.Volumes
 		envVars = append(envVars, r.ccRuntime.Spec.Config.PreInstall.EnvironmentVariables...)
 	case PostUninstallOperation:
 		dsName = "cc-operator-post-uninstall-daemon"

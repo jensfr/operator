@@ -146,6 +146,12 @@ spec:
                     items:
                       type: string
                     type: array
+                  doneLabel:
+                    additionalProperties:
+                      type: string
+                    description: This specifies the environment variables required
+                      by the daemon set
+                    type: object
                   environmentVariables:
                     description: This specifies the environment variables required
                       by the daemon set
@@ -1876,7 +1882,7 @@ spec:
                       daemonset
                     properties:
                       cmd:
-                        description: This specifies the command executes before InstallCmd
+                        description: This specifies the command executes before UninstallCmd
                         items:
                           type: string
                         type: array
