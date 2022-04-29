@@ -19,7 +19,12 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"reflect"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	"strings"
 	"time"
 
@@ -53,7 +58,7 @@ type CcRuntimeReconciler struct {
 //+kubebuilder:rbac:groups=confidentialcontainers.org,resources=ccruntimes,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=confidentialcontainers.org,resources=ccruntimes/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=confidentialcontainers.org,resources=ccruntimes/finalizers,verbs=update
-//+kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch;patch
+//+kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch;patch;update
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;delete;update;patch
 //+kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch;create;update;patch;delete
 
@@ -84,6 +89,18 @@ func (r *CcRuntimeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// Error reading the object - requeue the request.
 		return ctrl.Result{}, err
 	}
+	// Create the uninstall DaemonSet
+	ds := r.processDaemonset(UninstallOperation)
+	if err := controllerutil.SetControllerReference(r.ccRuntime, ds, r.Scheme); err != nil {
+		r.Log.Error(err, "Failed setting ControllerReference for uninstall DS")
+		return ctrl.Result{}, err
+	}
+	foundDs := &appsv1.DaemonSet{}
+	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: ds.Name, Namespace: ds.Namespace}, foundDs)
+	if err != nil && errors.IsNotFound(err) {
+		r.Log.Info("Creating cleanup Daemonset", "ds.Namespace", ds.Namespace, "ds.Name", ds.Name)
+		err = r.Client.Create(context.TODO(), ds)
+	}
 
 	// Check if the CcRuntime instance is marked to be deleted, which is
 	// indicated by the deletion timestamp being set.
@@ -91,8 +108,9 @@ func (r *CcRuntimeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		r.Log.Info("ccRuntime instance marked deleted")
 		res, err := r.processCcRuntimeDeleteRequest()
 		if err != nil || res.Requeue {
-			r.Log.Info("error or requeue from processCcRuntimeDeleteRequest")
 			return res, err
+		} else {
+			return ctrl.Result{}, nil
 		}
 		if r.ccRuntime.Spec.Config.PostUninstall.Image != "" {
 			r.Log.Info("calling handlePostUninstall")
@@ -109,17 +127,93 @@ func (r *CcRuntimeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return r.processCcRuntimeInstallRequest()
 }
 
+func (r *CcRuntimeReconciler) getNodeClient() (v1.NodeInterface, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	nodeClient := clientset.CoreV1().Nodes()
+	return nodeClient, err
+}
+
+func (r *CcRuntimeReconciler) setCleanupNodeLabels() (ctrl.Result, error) {
+	var nodesList = &corev1.NodeList{}
+	nodesClient, err := r.getNodeClient()
+	if err != nil {
+		r.Log.Info("Couldn't get nodes client")
+		return ctrl.Result{}, err
+	}
+
+	listOpts := []client.ListOption{
+		client.MatchingLabels(r.ccRuntime.Spec.Config.InstallDoneLabel),
+	}
+
+	err = r.Client.List(context.TODO(), nodesList, listOpts...)
+	if err != nil {
+		r.Log.Info("failed to list nodes during uninstallation status update")
+		return ctrl.Result{}, err
+	}
+
+	installDoneLabel := make([]string, 0, len(r.ccRuntime.Spec.Config.InstallDoneLabel))
+	for key := range r.ccRuntime.Spec.Config.InstallDoneLabel {
+		installDoneLabel = append(installDoneLabel, key)
+	}
+	if len(installDoneLabel) > 1 {
+		return ctrl.Result{}, fmt.Errorf("installDoneLabel must only have one entry")
+	}
+
+	for _, node := range nodesList.Items {
+		for k, v := range node.GetLabels() {
+			if k == installDoneLabel[0] && v == "true" {
+				nodeLabels := node.GetLabels()
+				nodeLabels[k] = "cleanup"
+				node.SetLabels(nodeLabels)
+				break
+			}
+		}
+		_, err := nodesClient.Update(context.TODO(), &node, metav1.UpdateOptions{
+			TypeMeta:     metav1.TypeMeta{},
+			DryRun:       nil,
+			FieldManager: "",
+		})
+		if err != nil {
+			r.Log.Info("failed to update node labels")
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
 func (r *CcRuntimeReconciler) processCcRuntimeDeleteRequest() (ctrl.Result, error) {
-	// Run kata-cleanup logic
-	r.Log.Info("processCcRuntimeDeleteRequest()")
+	var result = ctrl.Result{}
+
+	// Create the uninstall DaemonSet
+	ds := r.processDaemonset(UninstallOperation)
+	if err := controllerutil.SetControllerReference(r.ccRuntime, ds, r.Scheme); err != nil {
+		r.Log.Error(err, "Failed setting ControllerReference for uninstall DS")
+		return ctrl.Result{}, err
+	}
+	foundDs := &appsv1.DaemonSet{}
+	err := r.Client.Get(context.TODO(), types.NamespacedName{Name: ds.Name, Namespace: ds.Namespace}, foundDs)
+	if err != nil && errors.IsNotFound(err) {
+		r.Log.Info("Creating cleanup Daemonset", "ds.Namespace", ds.Namespace, "ds.Name", ds.Name)
+		err = r.Client.Create(context.TODO(), ds)
+	}
+
+	if err != nil {
+		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
+	}
 
 	if contains(r.ccRuntime.GetFinalizers(), RuntimeConfigFinalizer) {
-		// Delete install DS
-		r.Log.Info("Deleting install Daemonset")
-		installDs := &appsv1.DaemonSet{}
-		installDsName := "cc-operator-daemon-" + string(InstallOperation)
-		installDsNamespace := "confidential-containers-system"
-		err := r.Client.Get(context.TODO(), types.NamespacedName{Name: installDsName, Namespace: installDsNamespace}, installDs)
+		// Check for nodes with label set by install DS prestop hook.
+		// If no nodes exist then remove finalizer and reconcile
+		err, nodes := r.getNodesWithLabels(r.ccRuntime.Spec.Config.UninstallDoneLabel)
 		if err != nil {
 			r.Log.Info("type of error", "type", reflect.TypeOf(err))
 			if errors.IsNotFound(err) || errors.IsGone(err) {
@@ -133,36 +227,47 @@ func (r *CcRuntimeReconciler) processCcRuntimeDeleteRequest() (ctrl.Result, erro
 				if len(nodes.Items) == 0 {
 					r.Log.Info("No Nodes with required labels found. Remove Finalizer")
 					controllerutil.RemoveFinalizer(r.ccRuntime, RuntimeConfigFinalizer)
-					// Update CR
-					err = r.Client.Update(context.TODO(), r.ccRuntime)
+					result, err = r.updateCcRuntime()
 					if err != nil {
-						r.Log.Error(err, "Failed to update ccRuntime with finalizer")
-						return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, err
+						return result, err
 					}
-					// Requeue the request
-					return ctrl.Result{Requeue: true}, nil
+					result, err = r.deleteUninstallDaemonsets()
 				}
 			}
-			r.Log.Error(err, "Error in getting Install Daemonset")
-			return ctrl.Result{}, err
-		} else {
-			err := r.Client.Delete(context.TODO(), installDs)
-			if err != nil {
-				r.Log.Error(err, "Error in deleting Install Daemonset")
-				return ctrl.Result{}, err
-			} else {
-				return ctrl.Result{Requeue: true, RequeueAfter: 20 * time.Second}, nil
-			}
+			return result, err
 		}
+
+		result, err = r.updateUninstallationStatus(finishedNodes)
+		if err != nil {
+			r.Log.Info("Error from updateUninstallationStatus")
+			return result, err
+		}
+		result.Requeue = true
+		result.RequeueAfter = time.Second * 10
+	}
+	return result, err
+}
+
+func (r *CcRuntimeReconciler) updateCcRuntime() (ctrl.Result, error) {
+	err := r.Client.Update(context.TODO(), r.ccRuntime)
+	if err != nil {
+		r.Log.Error(err, "failed to update ccRuntime")
+		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
 	}
 	return ctrl.Result{}, nil
 }
 
-func handlePostUninstall(r *CcRuntimeReconciler) (error, ctrl.Result) {
-	err, nodes := r.getNodesWithLabels(map[string]string{"cc-postuninstall/done": "true"})
+func allNodesDone(finishedNodes int, r *CcRuntimeReconciler) bool {
+	return finishedNodes == r.ccRuntime.Status.TotalNodesCount
+}
+
+func (r *CcRuntimeReconciler) updateUninstallationStatus(finishedNodes int) (ctrl.Result, error) {
+	var doneNodes []string
+
+	err, cleanupNodes := r.getNodesWithLabels(map[string]string{"katacontainers.io/kata-runtime": "cleanup"})
 	if err != nil {
-		r.Log.Info("couldn't GET labelled nodes")
-		return err, ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}
+		r.Log.Error(err, "Error in getting list of nodes with label katacontainers.io/kata-runtime=cleanup")
+		return ctrl.Result{}, err
 	}
 
 	r.Log.Info("postuninstall image2", "r.ccRuntime.Spec.Config.Image",
@@ -171,7 +276,6 @@ func handlePostUninstall(r *CcRuntimeReconciler) (error, ctrl.Result) {
 	if r.ccRuntime.Spec.Config.PostUninstall.Image != "" &&
 		len(nodes.Items) < r.ccRuntime.Status.TotalNodesCount &&
 		r.ccRuntime.Status.TotalNodesCount > 0 {
-		r.Log.Info("inside != nil check")
 		postUninstallDs := r.makeHookDaemonset(PostUninstallOperation)
 		r.Log.Info("ds = ", "daemonset", postUninstallDs)
 		// get daemonset
@@ -184,42 +288,39 @@ func handlePostUninstall(r *CcRuntimeReconciler) (error, ctrl.Result) {
 }
 
 func (r *CcRuntimeReconciler) processCcRuntimeInstallRequest() (ctrl.Result, error) {
+	nodesList := &corev1.NodeList{}
+
+	if r.ccRuntime.Spec.CcNodeSelector == nil {
+		r.ccRuntime.Spec.CcNodeSelector = &metav1.LabelSelector{
+			MatchLabels: map[string]string{"node-role.kubernetes.io/worker": ""},
+		}
+	}
+
+	listOpts := []client.ListOption{
+		client.MatchingLabels(r.ccRuntime.Spec.CcNodeSelector.MatchLabels),
+	}
+
+	err := r.Client.List(context.TODO(), nodesList, listOpts...)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	r.ccRuntime.Status.TotalNodesCount = len(nodesList.Items)
+
 	if r.ccRuntime.Status.TotalNodesCount == 0 {
+		return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second},
+			fmt.Errorf("no suitable worker nodes found for runtime installation. Please make sure to label the nodes with labels specified in CcNodeSelector")
+	}
 
-		nodesList := &corev1.NodeList{}
+	if r.ccRuntime.Spec.Config.PayloadImage == "" {
+		return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second},
+			fmt.Errorf("PayloadImage must be specified to download the runtime binaries")
+	}
 
-		if r.ccRuntime.Spec.CcNodeSelector == nil {
-			r.ccRuntime.Spec.CcNodeSelector = &metav1.LabelSelector{
-				MatchLabels: map[string]string{"node-role.kubernetes.io/worker": ""},
-			}
-		}
+	r.ccRuntime.Status.RuntimeName = r.ccRuntime.Spec.RuntimeName
 
-		listOpts := []client.ListOption{
-			client.MatchingLabels(r.ccRuntime.Spec.CcNodeSelector.MatchLabels),
-		}
-
-		err := r.Client.List(context.TODO(), nodesList, listOpts...)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		r.ccRuntime.Status.TotalNodesCount = len(nodesList.Items)
-
-		if r.ccRuntime.Status.TotalNodesCount == 0 {
-			return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second},
-				fmt.Errorf("no suitable worker nodes found for runtime installation. Please make sure to label the nodes with labels specified in CcNodeSelector")
-		}
-
-		if r.ccRuntime.Spec.Config.PayloadImage == "" {
-			return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second},
-				fmt.Errorf("PayloadImage must be specified to download the runtime binaries")
-		}
-
-		r.ccRuntime.Status.RuntimeName = r.ccRuntime.Spec.RuntimeName
-
-		err = r.Client.Status().Update(context.TODO(), r.ccRuntime)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
+	err = r.Client.Status().Update(context.TODO(), r.ccRuntime)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// if ds exists, get all labels
@@ -262,37 +363,10 @@ func (r *CcRuntimeReconciler) processCcRuntimeInstallRequest() (ctrl.Result, err
 			return ctrl.Result{}, err
 		}
 
-		return r.monitorCcRuntimeInstallation()
 	}
+	return r.monitorCcRuntimeInstallation()
 
-	// Create the uninstall DaemonSet as well. It'll run only when nodes gets labelled as part of preStop hook
-	ds := r.processDaemonset(UninstallOperation)
-	// Set CcRuntime instance as the owner and controller
-	if err := controllerutil.SetControllerReference(r.ccRuntime, ds, r.Scheme); err != nil {
-		r.Log.Error(err, "Failed setting ControllerReference for uninstall DS")
-		return ctrl.Result{}, err
-	}
-	foundDs := &appsv1.DaemonSet{}
-	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: ds.Name, Namespace: ds.Namespace}, foundDs)
-	if err != nil && errors.IsNotFound(err) {
-		r.Log.Info("Creating cleanup Daemonset", "ds.Namespace", ds.Namespace, "ds.Name", ds.Name)
-		err = r.Client.Create(context.TODO(), ds)
-		if err != nil {
-			r.Log.Error(err, "Error in creating Cleanup Daemonset")
-			return ctrl.Result{}, err
-		}
-	} else if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Add finalizer for this CR
-	if !contains(r.ccRuntime.GetFinalizers(), RuntimeConfigFinalizer) {
-		if err := r.addFinalizer(); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-
-	return ctrl.Result{}, nil
+	//return ctrl.Result{}, err
 }
 
 func (r *CcRuntimeReconciler) handlePrePostDs(preInstallDs *appsv1.DaemonSet, doneLabel map[string]string) (
@@ -329,26 +403,81 @@ func (r *CcRuntimeReconciler) handlePrePostDs(preInstallDs *appsv1.DaemonSet, do
 }
 
 func (r *CcRuntimeReconciler) monitorCcRuntimeInstallation() (ctrl.Result, error) {
+	var (
+		err    error
+		result ctrl.Result
+	)
+
 	// If the installation of the binaries is successful on all nodes, proceed with creating the runtime classes
-	if r.ccRuntime.Status.TotalNodesCount > 0 && r.ccRuntime.Status.InstallationStatus.InProgress.InProgressNodesCount == r.ccRuntime.Status.TotalNodesCount {
+	if r.allNodesInstalled() {
 		rs, err := r.setRuntimeClass()
 		if err != nil {
 			return rs, err
 		}
-
-		r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesList = r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList
+		// Add finalizer for this CR
+		if !contains(r.ccRuntime.GetFinalizers(), RuntimeConfigFinalizer) {
+			if err := r.addFinalizer(); err != nil {
+				return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, err
+			}
+		}
 		r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesCount = len(r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesList)
 		r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList = []string{}
 		r.ccRuntime.Status.InstallationStatus.InProgress.InProgressNodesCount = 0
-
-		err = r.Client.Status().Update(context.TODO(), r.ccRuntime)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		return ctrl.Result{}, nil
 	}
 
+	err = r.Client.Status().Update(context.TODO(), r.ccRuntime)
+	if err != nil {
+		r.Log.Info("failed to update status while monitoring installation")
+		return ctrl.Result{}, err
+	}
+
+	nodesList, result, err := r.getAllNodes()
+	if err != nil {
+		return result, err
+	}
+
+	result, err = r.updateInstallationStatus(nodesList)
+	if err != nil {
+		return result, err
+	}
+
+	if r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesCount != r.ccRuntime.Status.TotalNodesCount {
+		return ctrl.Result{Requeue: true}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *CcRuntimeReconciler) updateInstallationStatus(nodesList *corev1.NodeList) (ctrl.Result, error) {
+	r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList = []string{}
+	for _, node := range nodesList.Items {
+		r.ccRuntime.Status.InstallationStatus.InProgress.InProgressNodesCount = len(r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList)
+		for k, v := range node.GetLabels() {
+			doneLabel, exists := r.ccRuntime.Spec.Config.InstallDoneLabel[k]
+			if exists && v == doneLabel {
+				if !contains(r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesList, node.Name) {
+					r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesCount++
+					r.Log.Info("adding new node to completed list", "nodeName", node.Name)
+					r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesList =
+						append(r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesList, node.Name)
+					r.ccRuntime.Status.InstallationStatus.InProgress.InProgressNodesCount = len(r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList)
+					if !contains(r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList, node.Name) {
+						r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList =
+							append(r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList, node.Name)
+					}
+				}
+			}
+		}
+		err := r.Client.Status().Update(context.TODO(), r.ccRuntime)
+		if err != nil {
+			r.Log.Info("Updating status of completed nodes etc failed")
+			return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, err
+		}
+
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *CcRuntimeReconciler) getAllNodes() (*corev1.NodeList, ctrl.Result, error) {
 	nodesList := &corev1.NodeList{}
 
 	if r.ccRuntime.Spec.CcNodeSelector == nil {
@@ -363,31 +492,15 @@ func (r *CcRuntimeReconciler) monitorCcRuntimeInstallation() (ctrl.Result, error
 
 	err := r.Client.List(context.TODO(), nodesList, listOpts...)
 	if err != nil {
-		return ctrl.Result{}, err
+		r.Log.Info("listing the nodes failed while monitoring the installation")
+		return nil, ctrl.Result{}, err
 	}
+	return nodesList, ctrl.Result{}, nil
+}
 
-	for _, node := range nodesList.Items {
-		if !contains(r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList, node.Name) {
-			for k, v := range node.GetLabels() {
-				//kata-deploy labels with katacontainers.io/kata-runtime:"true"
-				//TODO use generic label like confidentialcontainers.org/runtime:"true"
-				if k == "katacontainers.io/kata-runtime" && v == "true" {
-					r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList = append(r.ccRuntime.Status.InstallationStatus.InProgress.BinariesInstalledNodesList, node.Name)
-					r.ccRuntime.Status.InstallationStatus.InProgress.InProgressNodesCount++
-
-					err = r.Client.Status().Update(context.TODO(), r.ccRuntime)
-					if err != nil {
-						return ctrl.Result{}, err
-					}
-				}
-			}
-		}
-		if r.ccRuntime.Status.InstallationStatus.InProgress.InProgressNodesCount != r.ccRuntime.Status.TotalNodesCount {
-			return ctrl.Result{Requeue: true}, nil
-		}
-	}
-
-	return ctrl.Result{}, nil
+func (r *CcRuntimeReconciler) allNodesInstalled() bool {
+	return r.ccRuntime.Status.TotalNodesCount > 0 &&
+		r.ccRuntime.Status.InstallationStatus.Completed.CompletedNodesCount == r.ccRuntime.Status.TotalNodesCount
 }
 
 func (r *CcRuntimeReconciler) setRuntimeClass() (ctrl.Result, error) {
@@ -433,7 +546,9 @@ func (r *CcRuntimeReconciler) setRuntimeClass() (ctrl.Result, error) {
 
 	r.ccRuntime.Status.RuntimeClass = strings.Join(runtimeClassNames, ",")
 	err := r.Client.Status().Update(context.TODO(), r.ccRuntime)
-	if err != nil {
+	if (err != nil && !errors.IsConflict(err)) ||
+		(err != nil && !errors.IsAlreadyExists(err)) {
+		r.Log.Error(err, "can't set runtimeclass")
 		return ctrl.Result{}, err
 	}
 
@@ -449,11 +564,13 @@ func (r *CcRuntimeReconciler) processDaemonset(operation DaemonOperation) *appsv
 		"name": dsName,
 	}
 
-	r.Log.Info("processDaemonset", "operation", operation)
-
 	var nodeSelector map[string]string
-	if r.ccRuntime.Spec.CcNodeSelector != nil {
+	if r.ccRuntime.Spec.CcNodeSelector != nil && operation == InstallOperation {
 		nodeSelector = r.ccRuntime.Spec.CcNodeSelector.MatchLabels
+	} else if operation == UninstallOperation {
+		nodeSelector = map[string]string{
+			"katacontainers.io/kata-runtime": "cleanup",
+		}
 	} else {
 		nodeSelector = map[string]string{
 			"node-role.kubernetes.io/worker": "",
@@ -463,9 +580,7 @@ func (r *CcRuntimeReconciler) processDaemonset(operation DaemonOperation) *appsv
 	var containerCommand []string
 	preStopHook := &corev1.Lifecycle{}
 
-	r.Log.Info("cleanupCmd in kataconfig", "cleanupCmd", r.ccRuntime.Spec.Config.CleanupCmd)
 	if operation == InstallOperation {
-		r.Log.Info("in installop")
 		preStopHook = &corev1.Lifecycle{
 			PreStop: &corev1.Handler{
 				Exec: &corev1.ExecAction{
@@ -478,7 +593,6 @@ func (r *CcRuntimeReconciler) processDaemonset(operation DaemonOperation) *appsv
 
 	if operation == UninstallOperation {
 		containerCommand = r.ccRuntime.Spec.Config.UninstallCmd
-		//nodeSelector = r.ccRuntime.Spec.Config.CleanupNodeSelector.MatchLabels
 	}
 
 	return &appsv1.DaemonSet{
@@ -671,4 +785,29 @@ func (r *CcRuntimeReconciler) makeHookDaemonset(operation DaemonOperation) *apps
 			},
 		},
 	}
+}
+
+func (r *CcRuntimeReconciler) deleteUninstallDaemonsets() (ctrl.Result, error) {
+	ds := r.processDaemonset(InstallOperation)
+	result, err := r.deleteDaemonset(ds)
+	if err != nil {
+		return result, err
+	}
+	ds = r.makeHookDaemonset(PostUninstallOperation)
+	result, err = r.deleteDaemonset(ds)
+	if err != nil {
+		return result, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *CcRuntimeReconciler) deleteDaemonset(ds *appsv1.DaemonSet) (ctrl.Result, error) {
+	err := r.Client.Delete(context.TODO(), ds)
+	if err != nil && !errors.IsNotFound(err) && !errors.IsGone(err) {
+		r.Log.Error(err, "Couldn't delete Daemonset ", "Name:", ds.Name)
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
 }
