@@ -180,10 +180,18 @@ type CcInstallConfig struct {
 	// This specifies the configuration for the post-uninstall daemonset
 	// +optional
 	PostUninstall PostUninstallConfig `json:"postUninstall,omitempty"`
+
+	// This specifies the label that the install daemonset adds to nodes
+	// when the installation is done
+	InstallDoneLabel map[string]string `json:"installDoneLabel,omitempty"`
+
+	// This specifies the label that the uninstall daemonset adds to nodes
+	// when the uninstallation  is done
+	UninstallDoneLabel map[string]string `json:"uninstallDoneLabel,omitempty"`
 }
 
 type PostUninstallConfig struct {
-	// This specifies the command executes before InstallCmd
+	// This specifies the command executes before UninstallCmd
 	// +optional
 	Cmd []string `json:"cmd,omitempty"`
 
